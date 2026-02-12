@@ -1,6 +1,14 @@
 /*
  * for enabling virtual mouse anywhere on the TCL FLIP 2
  * tyler boni <tyler.boni@gmail.com>
+ *
+ * Modified: add a control interface (files + UNIX socket) so other services/apps
+ * can request enable/disable/toggle/status/quit.
+ *
+ * IMPORTANT BEHAVIOR CHANGE (per request):
+ * - These controls are NOT "forced" overrides.
+ * - Manual user toggle still works at all times.
+ * - Control files are treated as one-shot commands (FlipMouse consumes/deletes them).
  */
 
 // #define DEBUG 1
@@ -19,6 +27,11 @@
 #include <signal.h>
 #include <sys/signalfd.h>
 
+/* NEW: control interface */
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+
 /* Configuration */
 #define DEV_INPUT "/dev/input"
 #define LOG_FILE "/cache/FlipMouse.log"
@@ -27,6 +40,14 @@
 #else
 #define ENABLE_LOG 0
 #endif
+
+/* NEW: control paths (one-shot commands, not force) */
+#define CMD_DIR "/data/local/tmp/flipmouse"
+#define CMD_ENABLE_FILE  "/data/local/tmp/flipmouse/enable"
+#define CMD_DISABLE_FILE "/data/local/tmp/flipmouse/disable"
+#define CMD_TOGGLE_FILE  "/data/local/tmp/flipmouse/toggle"
+#define CONTROL_SOCK     "/data/local/tmp/flipmouse/sock"
+#define STATUS_FILE      "/data/local/tmp/flipmouse/status"
 
 /* Constants */
 #define MIN_MOUSE_SPEED 1
@@ -79,6 +100,9 @@ typedef struct
   const keymap_t *keymap;
   size_t keymap_size;
   volatile sig_atomic_t running;
+
+  /* NEW: control interface state */
+  int control_fd;
 } app_state_t;
 
 /* Device list */
@@ -139,6 +163,13 @@ static void log_event(const char *prefix, struct input_event *ev);
 /* Signal handling */
 static void signal_handler(int sig);
 static void setup_signal_handlers(void);
+
+/* Control interface */
+static int control_init(void);
+static void control_cleanup(void);
+static void control_handle_ready(void);
+static void control_poll_command_files(void);
+static void write_status_file(void);
 
 /* Main loop */
 static int run_event_loop(void);
@@ -243,6 +274,181 @@ static int keymap_get_keycode(int scanvalue)
   return -1; /* Not found */
 }
 
+/* --- Control Interface (files + socket) --- */
+
+static int file_exists(const char *path)
+{
+  return access(path, F_OK) == 0;
+}
+
+/*
+ * One-shot command files:
+ *   touch /cache/FlipMouse.enable   -> enable mouse mode
+ *   touch /cache/FlipMouse.disable  -> disable mouse mode
+ *   touch /cache/FlipMouse.toggle   -> toggle mouse mode
+ *
+ * FlipMouse consumes (deletes) the file after processing.
+ * This is intentionally NOT a "force" override: user can still toggle anytime.
+ */
+static void control_poll_command_files(void)
+{
+  int changed = 0;
+
+  if (file_exists(CMD_ENABLE_FILE))
+  {
+    unlink(CMD_ENABLE_FILE);
+    if (!app_state.mouse.enabled) {
+      app_state.mouse.enabled = 1;
+      changed = 1;
+      log_message("Mouse mode enabled (command file)");
+    }
+  }
+
+  if (file_exists(CMD_DISABLE_FILE))
+  {
+    unlink(CMD_DISABLE_FILE);
+    if (app_state.mouse.enabled) {
+      app_state.mouse.enabled = 0;
+      changed = 1;
+      log_message("Mouse mode disabled (command file)");
+    }
+  }
+
+  if (file_exists(CMD_TOGGLE_FILE))
+  {
+    unlink(CMD_TOGGLE_FILE);
+    app_state.mouse.enabled = !app_state.mouse.enabled;
+    changed = 1;
+    log_message("Mouse mode toggled (command file) -> %s",
+                app_state.mouse.enabled ? "enabled" : "disabled");
+  }
+
+  if (changed) write_status_file();
+}
+
+static void write_status_file(void) {
+  int fd = open(STATUS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (fd < 0) return;
+  dprintf(fd, "enabled=%d speed=%d drag=%d\n",
+          app_state.mouse.enabled, app_state.mouse.speed, app_state.mouse.drag_mode);
+  close(fd);
+}
+
+static int control_init(void)
+{
+  mkdir(CMD_DIR, 0777);
+  chmod(CMD_DIR, 0777);
+
+  app_state.control_fd = -1;
+
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0)
+  {
+    log_perror("socket(AF_UNIX)");
+    return -1;
+  }
+
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, CONTROL_SOCK, sizeof(addr.sun_path) - 1);
+
+  unlink(CONTROL_SOCK);
+
+  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+  {
+    log_perror("bind(CONTROL_SOCK)");
+    close(fd);
+    return -1;
+  }
+
+  /* Allow other processes to talk to it (still depends on SELinux/root context) */
+  chmod(CONTROL_SOCK, 0666);
+
+  if (listen(fd, 4) < 0)
+  {
+    log_perror("listen(CONTROL_SOCK)");
+    close(fd);
+    unlink(CONTROL_SOCK);
+    return -1;
+  }
+
+  app_state.control_fd = fd;
+  log_message("Control socket listening at %s", CONTROL_SOCK);
+  return 0;
+}
+
+static void control_cleanup(void)
+{
+  if (app_state.control_fd >= 0)
+  {
+    close(app_state.control_fd);
+    app_state.control_fd = -1;
+  }
+  unlink(CONTROL_SOCK);
+}
+
+static void control_handle_command(int client_fd, const char *cmd)
+{
+  while (*cmd == ' ' || *cmd == '\n' || *cmd == '\r' || *cmd == '\t')
+    cmd++;
+
+  if (strncmp(cmd, "enable", 6) == 0)
+  {
+    app_state.mouse.enabled = 1;
+    write_status_file();
+    dprintf(client_fd, "ok enabled\n");
+    log_message("Mouse enabled (socket)");
+  }
+  else if (strncmp(cmd, "disable", 7) == 0)
+  {
+    app_state.mouse.enabled = 0;
+    write_status_file();
+    dprintf(client_fd, "ok disabled\n");
+    log_message("Mouse disabled (socket)");
+  }
+  else if (strncmp(cmd, "toggle", 6) == 0)
+  {
+    app_state.mouse.enabled = !app_state.mouse.enabled;
+    dprintf(client_fd, "ok %s\n", app_state.mouse.enabled ? "enabled" : "disabled");
+    log_message("Mouse toggled (socket) -> %s", app_state.mouse.enabled ? "enabled" : "disabled");
+  }
+  else if (strncmp(cmd, "status", 6) == 0)
+  {
+    dprintf(client_fd, "enabled=%d speed=%d drag=%d\n",
+            app_state.mouse.enabled,
+            app_state.mouse.speed,
+            app_state.mouse.drag_mode);
+  }
+  else if (strncmp(cmd, "quit", 4) == 0)
+  {
+    dprintf(client_fd, "ok quitting\n");
+    log_message("Quit requested (socket)");
+    app_state.running = 0;
+  }
+  else
+  {
+    dprintf(client_fd, "err unknown_command\n");
+  }
+}
+
+static void control_handle_ready(void)
+{
+  int cfd = accept(app_state.control_fd, NULL, NULL);
+  if (cfd < 0)
+    return;
+
+  char buf[128];
+  ssize_t n = read(cfd, buf, sizeof(buf) - 1);
+  if (n > 0)
+  {
+    buf[n] = '\0';
+    control_handle_command(cfd, buf);
+  }
+
+  close(cfd);
+}
+
 /* --- Mouse Functions --- */
 
 static int mouse_init(void)
@@ -275,10 +481,12 @@ static int mouse_init(void)
     app_state.mouse.dev = NULL;
     return -1;
   }
+
   /* Initialize mouse parameters */
   app_state.mouse.enabled = 0;
   app_state.mouse.speed = 4;
   app_state.mouse.drag_mode = 0;
+  app_state.mouse.toggle_down_at = 0;
 
   log_message("Virtual mouse initialized successfully");
   return 0;
@@ -300,7 +508,8 @@ static void mouse_cleanup(void)
 
   log_message("Virtual mouse resources released");
 }
-// mouse_toggle(ev)
+
+/* mouse_toggle(ev) */
 static int mouse_toggle(struct input_event *ev)
 {
   if (ev->value == 1)
@@ -314,8 +523,9 @@ static int mouse_toggle(struct input_event *ev)
     if (get_toggle_time(ev->input_event_sec) < MAX_TOGGLE_HOLD_TIME)
     {
       app_state.mouse.enabled = !app_state.mouse.enabled;
+      write_status_file();
       app_state.mouse.toggle_down_at = 0;
-      log_message("Mouse mode %s", app_state.mouse.enabled ? "enabled" : "disabled");
+      log_message("Mouse mode %s (manual)", app_state.mouse.enabled ? "enabled" : "disabled");
       return CHANGED_TO_MOUSE;
     }
     return CHANGED_TO_MOUSE;
@@ -325,6 +535,7 @@ static int mouse_toggle(struct input_event *ev)
     return MUTE_EVENT;
   }
 }
+
 static int get_toggle_time(int event_time)
 {
   if (app_state.mouse.toggle_down_at == 0)
@@ -337,6 +548,7 @@ static int get_toggle_time(int event_time)
   log_message("Toggle key held for %d seconds", timediff);
   return timediff;
 }
+
 static int mouse_handle_event(device_t *dev, struct input_event *ev)
 {
   static unsigned int slowdown_counter = 0;
@@ -643,7 +855,8 @@ static int handle_input_event(device_t *dev, struct input_event *ev)
       }
     }
   }
-  /* Check if it's the toggle key */
+
+  /* Check if it's the toggle key (manual always allowed) */
   if (ev->type == EV_KEY)
   {
     if (ev->code == KEY_HELP || ev->code == KEY_F12)
@@ -693,13 +906,27 @@ static int run_event_loop(void)
       maxfd = d->fd + 1;
   }
 
+  if (app_state.control_fd >= 0)
+  {
+    FD_SET(app_state.control_fd, &fds);
+    if (app_state.control_fd >= maxfd)
+      maxfd = app_state.control_fd + 1;
+  }
+
   log_message("Entering main event loop");
   app_state.running = 1;
 
   while (app_state.running)
   {
     rfds = fds;
-    if (select(maxfd, &rfds, NULL, NULL, NULL) < 0)
+
+    /* We use a short timeout so command files can be noticed even if no input events happen. */
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 200000; /* 200ms */
+
+    int sel = select(maxfd, &rfds, NULL, NULL, &tv);
+    if (sel < 0)
     {
       if (errno == EINTR)
         continue; /* Interrupted by signal */
@@ -707,6 +934,22 @@ static int run_event_loop(void)
       log_message("ERROR: select() failed");
       log_perror("select");
       break;
+    }
+
+    /* Always poll command files (one-shot) */
+    control_poll_command_files();
+
+    /* Control socket ready? */
+    if (sel > 0 && app_state.control_fd >= 0 && FD_ISSET(app_state.control_fd, &rfds))
+    {
+      control_handle_ready();
+      /* continue to input handling; there may be both */
+    }
+
+    if (sel == 0)
+    {
+      /* timeout only; loop continues */
+      continue;
     }
 
     for (device_t *d = app_state.devices; d; d = d->next)
@@ -759,6 +1002,9 @@ static int run_event_loop(void)
 
 int main(int argc, char **argv)
 {
+  (void)argc;
+  (void)argv;
+
   /* Initialize logging */
   log_init();
   log_message("FlipMouse starting up");
@@ -783,10 +1029,17 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  /* Initialize control interface (optional) */
+  if (control_init() != 0)
+  {
+    log_message("WARNING: control interface failed to init (continuing)");
+  }
+
   /* Run the main event loop */
   int result = run_event_loop();
 
   /* Clean up all resources */
+  control_cleanup();
   mouse_cleanup();
   devices_cleanup();
 
