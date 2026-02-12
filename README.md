@@ -64,22 +64,55 @@ FlipMouse enables a virtual mouse mode that can be toggled on and off, allowing 
 2. Install dependencies:
 
    ```
-   # Debian/Ubuntu
-   sudo apt update
-   sudo apt install unzip wget tar build-essential
+   # Mac
 
-   mkdir -p $HOME/Android/Sdk/cmdline-tools
-   d $HOME/Android/Sdk/cmdline-tools
-
-   wget https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-   unzip commandlinetools-linux-11076708_latest.zip
-   mv cmdline-tools latest
-
-   export ANDROID_HOME=$HOME/Android/Sdk
-   export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$PATH
-
-   sudo apt-get install libevdev-dev
+   xcode-select --install
+   brew install autoconf automake libtool pkg-config make wget coreutils
    ```
+
+2️⃣ Install Android SDK Command Line Tools (CLI only)
+
+```
+
+export ANDROID_SDK_ROOT="$HOME/Library/Android/sdk"
+mkdir -p "$ANDROID_SDK_ROOT"
+
+cd /tmp
+curl -L -O https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip
+unzip -q commandlinetools-mac-11076708_latest.zip -d cmdline-tools-temp
+
+
+mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+rm -rf "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+mv cmdline-tools-temp/cmdline-tools "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+
+export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+```
+
+Verify:
+
+```
+which sdkmanager
+sdkmanager --version
+```
+
+You should see something like:
+/Users/<you>/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager
+
+Install NDK:
+
+```
+yes | sdkmanager --licenses
+
+sdkmanager "ndk;26.1.10909125"
+
+ls "$ANDROID_SDK_ROOT/ndk/26.1.10909125/toolchains/llvm/prebuilt" # You should see darwin-arm64
+
+export ANDROID_SDK_ROOT="$HOME/Library/Android/sdk"
+export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+
+source ~/.zshrc
+```
 
 3. Compile the code (assumes ARM):
 
@@ -128,11 +161,3 @@ Tyler Boni
 Contributions are welcome! Please feel free to submit a Pull Request.
 
 <a href="https://www.buymeacoffee.com/tylerboni" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
-
-```
-
-```
-
-```
-
-```
