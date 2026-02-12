@@ -65,25 +65,39 @@ FlipMouse enables a virtual mouse mode that can be toggled on and off, allowing 
 
    ```
    # Debian/Ubuntu
+   sudo apt update
+   sudo apt install unzip wget tar build-essential
+
+   mkdir -p $HOME/Android/Sdk/cmdline-tools
+   d $HOME/Android/Sdk/cmdline-tools
+
+   wget https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+   unzip commandlinetools-linux-11076708_latest.zip
+   mv cmdline-tools latest
+
+   export ANDROID_HOME=$HOME/Android/Sdk
+   export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$PATH
+
    sudo apt-get install libevdev-dev
    ```
 
-   ```
-   # Arch
-   sudo pacman -S libevdev
-   ```
+3. Compile the code (assumes ARM):
 
-3. Compile the code:
+```
 
-   ```
-   # Debug flag builds for linux desktop and runs
-   ./make-mouse [--debug]
-   ```
+# Debug flag builds for linux desktop and runs
+
+./make-mouse [--debug]
+
+```
 
 4. To install:
-   ```
-   ./install
-   ```
+
+```
+
+./install
+
+```
 
 ## How It Works
 
@@ -114,3 +128,11 @@ Tyler Boni
 Contributions are welcome! Please feel free to submit a Pull Request.
 
 <a href="https://www.buymeacoffee.com/tylerboni" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+
+```
+
+```
+
+```
+
+```

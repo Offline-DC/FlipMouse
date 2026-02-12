@@ -68,10 +68,10 @@ if [ $DEBUG_MODE -eq 1 ]; then
 else
     # Original Android build logic
     # NDK path - update this to match your setup
-    NDK=$HOME/Android/Sdk/ndk/29.0.13113456
+    NDK=$HOME/Android/Sdk/ndk/26.1.10909125
     API=30
     TARGET=armv7a-linux-androideabi
-    TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64
+    TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-aarch64
 
     # Add NDK tools to PATH
     export PATH=$TOOLCHAIN/bin:$PATH
