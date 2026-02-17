@@ -42,10 +42,6 @@
 #endif
 
 /* NEW: control paths (one-shot commands, not force) */
-#define CMD_DIR "/data/local/tmp/flipmouse"
-#define CMD_ENABLE_FILE  "/data/local/tmp/flipmouse/enable"
-#define CMD_DISABLE_FILE "/data/local/tmp/flipmouse/disable"
-#define CMD_TOGGLE_FILE  "/data/local/tmp/flipmouse/toggle"
 #define CONTROL_SOCK     "/data/local/tmp/flipmouse/sock"
 #define STATUS_FILE      "/data/local/tmp/flipmouse/status"
 
@@ -168,11 +164,12 @@ static void setup_signal_handlers(void);
 static int control_init(void);
 static void control_cleanup(void);
 static void control_handle_ready(void);
-static void control_poll_command_files(void);
 static void write_status_file(void);
 
 /* Main loop */
 static int run_event_loop(void);
+
+static int mouse_toggle(struct input_event *ev);
 
 /* --- Logging Functions --- */
 
@@ -281,51 +278,6 @@ static int file_exists(const char *path)
   return access(path, F_OK) == 0;
 }
 
-/*
- * One-shot command files:
- *   touch /cache/FlipMouse.enable   -> enable mouse mode
- *   touch /cache/FlipMouse.disable  -> disable mouse mode
- *   touch /cache/FlipMouse.toggle   -> toggle mouse mode
- *
- * FlipMouse consumes (deletes) the file after processing.
- * This is intentionally NOT a "force" override: user can still toggle anytime.
- */
-static void control_poll_command_files(void)
-{
-  int changed = 0;
-
-  if (file_exists(CMD_ENABLE_FILE))
-  {
-    unlink(CMD_ENABLE_FILE);
-    if (!app_state.mouse.enabled) {
-      app_state.mouse.enabled = 1;
-      changed = 1;
-      log_message("Mouse mode enabled (command file)");
-    }
-  }
-
-  if (file_exists(CMD_DISABLE_FILE))
-  {
-    unlink(CMD_DISABLE_FILE);
-    if (app_state.mouse.enabled) {
-      app_state.mouse.enabled = 0;
-      changed = 1;
-      log_message("Mouse mode disabled (command file)");
-    }
-  }
-
-  if (file_exists(CMD_TOGGLE_FILE))
-  {
-    unlink(CMD_TOGGLE_FILE);
-    app_state.mouse.enabled = !app_state.mouse.enabled;
-    changed = 1;
-    log_message("Mouse mode toggled (command file) -> %s",
-                app_state.mouse.enabled ? "enabled" : "disabled");
-  }
-
-  if (changed) write_status_file();
-}
-
 static void write_status_file(void) {
   int fd = open(STATUS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (fd < 0) return;
@@ -336,9 +288,6 @@ static void write_status_file(void) {
 
 static int control_init(void)
 {
-  mkdir(CMD_DIR, 0777);
-  chmod(CMD_DIR, 0777);
-
   app_state.control_fd = -1;
 
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -507,6 +456,35 @@ static void mouse_cleanup(void)
   }
 
   log_message("Virtual mouse resources released");
+}
+
+static int control_send_cmd(const char *cmd)
+{
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return 2;
+
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, CONTROL_SOCK, sizeof(addr.sun_path) - 1);
+
+  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    close(fd);
+    return 3;
+  }
+
+  write(fd, cmd, strlen(cmd));
+  write(fd, "\n", 1);
+
+  char buf[256];
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  if (n > 0) {
+    buf[n] = 0;
+    write(STDOUT_FILENO, buf, n);
+  }
+
+  close(fd);
+  return 0;
 }
 
 /* mouse_toggle(ev) */
@@ -936,9 +914,6 @@ static int run_event_loop(void)
       break;
     }
 
-    /* Always poll command files (one-shot) */
-    control_poll_command_files();
-
     /* Control socket ready? */
     if (sel > 0 && app_state.control_fd >= 0 && FD_ISSET(app_state.control_fd, &rfds))
     {
@@ -1004,6 +979,16 @@ int main(int argc, char **argv)
 {
   (void)argc;
   (void)argv;
+
+  if (argc >= 2) {
+  if (!strcmp(argv[1], "enable") ||
+      !strcmp(argv[1], "disable") ||
+      !strcmp(argv[1], "toggle") ||
+      !strcmp(argv[1], "status") ||
+      !strcmp(argv[1], "quit")) {
+    return control_send_cmd(argv[1]);
+  }
+}
 
   /* Initialize logging */
   log_init();
