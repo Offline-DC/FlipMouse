@@ -24,6 +24,9 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <linux/input-event-codes.h>
+#ifndef KEY_FOCUS
+#define KEY_FOCUS 212
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,7 +63,6 @@
 /* Constants */
 #define MIN_MOUSE_SPEED 1
 #define WHEEL_SLOWDOWN_FACTOR 5
-#define MAX_TOGGLE_HOLD_TIME 1
 
 /* Event action return codes */
 typedef enum
@@ -92,7 +94,7 @@ typedef struct dev_st
 typedef struct
 {
   int enabled;
-  int toggle_down_at;
+  long long toggle_down_at_ms;
   int speed;
   int drag_mode;
   struct libevdev *dev;
@@ -156,7 +158,6 @@ static int devices_find_and_init(void);
 static void devices_cleanup(void);
 
 /* Event handling */
-static int get_toggle_time(int event_time);
 static int handle_input_event(device_t *dev, struct input_event *ev);
 static int keymap_get_keycode(int scanvalue);
 static int keymap_get_scanvalue(int keycode);
@@ -185,8 +186,16 @@ static void park_bottom_right(void);
 static void move_from_park_to_center(void);
 static void on_enabled_transition(int was_enabled, int now_enabled, const char *why);
 
+static long long ev_time_ms(const struct input_event *ev);
+
 /* Main loop */
 static int run_event_loop(void);
+
+static long long ev_time_ms(const struct input_event *ev)
+{
+  return ((long long)ev->input_event_sec * 1000LL) +
+         ((long long)ev->input_event_usec / 1000LL);
+}
 
 /* --- Logging Functions --- */
 
@@ -546,7 +555,7 @@ static int mouse_init(void)
   app_state.mouse.enabled = 0;
   app_state.mouse.speed = 4;
   app_state.mouse.drag_mode = 0;
-  app_state.mouse.toggle_down_at = 0;
+  app_state.mouse.toggle_down_at_ms = 0;
 
   log_message("Virtual mouse initialized successfully");
   return 0;
@@ -570,41 +579,50 @@ static void mouse_cleanup(void)
 }
 
 /* manual toggle via KEY_HELP/KEY_F12 */
+#define TOGGLE_TAP_MAX_MS 400   // tap threshold; tweak 250–600 as desired
+
 static int mouse_toggle(struct input_event *ev)
 {
-  if (ev->value == 1)
-  {
-    app_state.mouse.toggle_down_at = ev->input_event_sec;
-    return CHANGED_TO_MOUSE;
-  }
-  else if (ev->value == 0 && app_state.mouse.toggle_down_at != 0)
-  {
-    if (get_toggle_time(ev->input_event_sec) < MAX_TOGGLE_HOLD_TIME)
-    {
-      int was = app_state.mouse.enabled;
-      app_state.mouse.enabled = !app_state.mouse.enabled;
-      write_status_file();
-      app_state.mouse.toggle_down_at = 0;
+if (ev->value == 1) // key down
+{
+  long long now = ev_time_ms(ev);
 
-      on_enabled_transition(was, app_state.mouse.enabled, "manual");
-      return CHANGED_TO_MOUSE;
-    }
-    return CHANGED_TO_MOUSE;
+  if (app_state.mouse.toggle_down_at_ms != 0) {
+    log_message("TOGGLE DOWN while already down; resetting (prev=%lldms now=%lldms)",
+                app_state.mouse.toggle_down_at_ms, now);
   }
-  else
-  {
-    return MUTE_EVENT;
-  }
+
+  app_state.mouse.toggle_down_at_ms = now;
+  log_message("TOGGLE DOWN code=%d t=%lldms", ev->code, now);
+  return CHANGED_TO_MOUSE;
 }
 
-static int get_toggle_time(int event_time)
-{
-  if (app_state.mouse.toggle_down_at == 0)
-    return 0;
+  if (ev->value == 0 && app_state.mouse.toggle_down_at_ms != 0) // key up
+  {
+    long long now = ev_time_ms(ev);
+    long long held = now - app_state.mouse.toggle_down_at_ms;
 
-  int timediff = event_time - app_state.mouse.toggle_down_at;
-  log_message("Toggle key held for %d seconds", timediff);
-  return timediff;
+    log_message("TOGGLE UP code=%d t=%lldms held=%lldms", ev->code, now, held);
+
+    int was = app_state.mouse.enabled;
+
+    if (held <= TOGGLE_TAP_MAX_MS)
+    {
+      app_state.mouse.enabled = !app_state.mouse.enabled;
+      write_status_file();
+      on_enabled_transition(was, app_state.mouse.enabled, "manual");
+      log_message("TOGGLE TAP accepted -> enabled=%d", app_state.mouse.enabled);
+    }
+    else
+    {
+      log_message("TOGGLE ignored (hold too long) held=%lldms", held);
+    }
+
+    app_state.mouse.toggle_down_at_ms = 0;
+    return CHANGED_TO_MOUSE;
+  }
+
+  return MUTE_EVENT;
 }
 
 static int mouse_handle_event(device_t *dev, struct input_event *ev)
@@ -864,31 +882,15 @@ static int handle_input_event(device_t *dev, struct input_event *ev)
 {
   (void)dev;
 
-  if (ev->type == MSC_SCAN && ev->code == MSC_SCAN)
-  {
-    int keycode = keymap_get_keycode(ev->value);
-    if (keycode == KEY_HELP || keycode == KEY_F12)
-    {
-      int td = app_state.mouse.toggle_down_at;
-      if (get_toggle_time(ev->input_event_sec) > MAX_TOGGLE_HOLD_TIME)
-      {
-        if (td > 1) app_state.mouse.toggle_down_at = 1;
-        else if (td == 1) app_state.mouse.toggle_down_at = 0;
-        else return MUTE_EVENT;
-
-        log_message("Trigger default button");
-        ev->type = EV_KEY;
-        ev->code = keycode;
-        ev->value = app_state.mouse.toggle_down_at;
-        return CHANGED_EVENT;
-      }
-    }
-  }
-
   if (ev->type == EV_KEY)
   {
-    if (ev->code == KEY_HELP || ev->code == KEY_F12)
+    if (ev->code == KEY_HELP || ev->code == KEY_F12 || ev->code == KEY_FOCUS)
+    {
+      log_message("EV_KEY toggle candidate code=%d value=%d enabled=%d t=%ld.%06ld",
+                  ev->code, ev->value, app_state.mouse.enabled,
+                  (long)ev->input_event_sec, (long)ev->input_event_usec);
       return mouse_toggle(ev);
+    }
   }
 
   if (!app_state.mouse.enabled)
