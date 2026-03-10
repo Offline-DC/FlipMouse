@@ -61,7 +61,6 @@
 #define CENTER_SETTLE_US (2 * 1000)
 
 /* Constants */
-#define MIN_MOUSE_SPEED 1
 #define WHEEL_SLOWDOWN_FACTOR 5
 
 /* Event action return codes */
@@ -650,24 +649,6 @@ static int mouse_handle_event(device_t *dev, struct input_event *ev)
 
   switch (keycode)
   {
-  case KEY_VOLUMEUP:
-    if (ev->value == 1)
-    {
-      app_state.mouse.speed++;
-      log_message("Mouse speed increased to %d", app_state.mouse.speed);
-    }
-    return MUTE_EVENT;
-
-  case KEY_VOLUMEDOWN:
-    if (ev->value == 1)
-    {
-      app_state.mouse.speed--;
-      if (app_state.mouse.speed < MIN_MOUSE_SPEED)
-        app_state.mouse.speed = MIN_MOUSE_SPEED;
-      log_message("Mouse speed decreased to %d", app_state.mouse.speed);
-    }
-    return MUTE_EVENT;
-
   case KEY_ENTER:
     log_message("Mouse left click");
     ev->type = EV_KEY;
