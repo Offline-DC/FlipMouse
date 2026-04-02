@@ -45,11 +45,8 @@
 /* Configuration */
 #define DEV_INPUT "/dev/input"
 #define LOG_FILE "/cache/FlipMouse.log"
-#ifdef DEBUG
+/* Always enable logging so issues can be diagnosed from logcat/adb */
 #define ENABLE_LOG 1
-#else
-#define ENABLE_LOG 0
-#endif
 
 /* Control paths */
 #define CONTROL_SOCK     "/data/local/tmp/flipmouse/sock"
@@ -622,11 +619,25 @@ static void check_long_press_timer(void)
   }
 }
 
+/* Get current CLOCK_MONOTONIC time in milliseconds. */
+static long long monotonic_now_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
 static int mouse_toggle(struct input_event *ev)
 {
 if (ev->value == 1) /* key down */
 {
-  long long now = ev_time_ms(ev);
+  /* Use CLOCK_MONOTONIC directly — do NOT use ev_time_ms(ev).
+   * Input event timestamps on some Android kernels (e.g. MTK) may come
+   * from CLOCK_REALTIME or CLOCK_BOOTTIME rather than CLOCK_MONOTONIC,
+   * which would make the key-held subtraction in check_long_press_timer()
+   * wildly wrong. By recording the down-time with the same clock we check
+   * against, the math is always correct regardless of kernel clock source. */
+  long long now = monotonic_now_ms();
 
   if (app_state.mouse.toggle_down_at_ms != 0) {
     log_message("TOGGLE DOWN while already down; resetting (prev=%lldms now=%lldms)",
@@ -635,13 +646,14 @@ if (ev->value == 1) /* key down */
 
   app_state.mouse.toggle_down_at_ms = now;
   toggle_long_press_fired            = 0;
-  log_message("TOGGLE DOWN code=%d t=%lldms", ev->code, now);
+  log_message("TOGGLE DOWN code=%d ev_t=%lldms mono_t=%lldms",
+              ev->code, ev_time_ms(ev), now);
   return CHANGED_TO_MOUSE;
 }
 
   if (ev->value == 0 && app_state.mouse.toggle_down_at_ms != 0) /* key up */
   {
-    long long now  = ev_time_ms(ev);
+    long long now  = monotonic_now_ms();
     long long held = now - app_state.mouse.toggle_down_at_ms;
 
     log_message("TOGGLE UP code=%d t=%lldms held=%lldms fired=%d",
