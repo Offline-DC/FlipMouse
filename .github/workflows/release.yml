@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      API: 30
+      TARGET: armv7a-linux-androideabi
+      NDK_VERSION: 26.1.10909125
+      LIBEVDEV_VERSION: 1.13.2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Android NDK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;$NDK_VERSION" || true
+
+      - name: Set up NDK toolchain
+        id: ndk
+        run: |
+          NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "ndk=$NDK" >> "$GITHUB_OUTPUT"
+          echo "toolchain=$TOOLCHAIN" >> "$GITHUB_OUTPUT"
+          echo "cc=$TOOLCHAIN/bin/${TARGET}${API}-clang" >> "$GITHUB_OUTPUT"
+          echo "cxx=$TOOLCHAIN/bin/${TARGET}${API}-clang++" >> "$GITHUB_OUTPUT"
+          echo "ar=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_OUTPUT"
+          echo "ranlib=$TOOLCHAIN/bin/llvm-ranlib" >> "$GITHUB_OUTPUT"
+          echo "strip=$TOOLCHAIN/bin/llvm-strip" >> "$GITHUB_OUTPUT"
+
+      - name: Build libevdev
+        run: |
+          mkdir -p build && cd build
+
+          if [ ! -f "libevdev-${LIBEVDEV_VERSION}.tar.xz" ]; then
+            curl -L -o "libevdev-${LIBEVDEV_VERSION}.tar.xz" \
+              "https://www.freedesktop.org/software/libevdev/libevdev-${LIBEVDEV_VERSION}.tar.xz"
+          fi
+
+          tar xf "libevdev-${LIBEVDEV_VERSION}.tar.xz"
+          cd "libevdev-${LIBEVDEV_VERSION}"
+
+          CC="${{ steps.ndk.outputs.cc }}" \
+          CXX="${{ steps.ndk.outputs.cxx }}" \
+          AR="${{ steps.ndk.outputs.ar }}" \
+          RANLIB="${{ steps.ndk.outputs.ranlib }}" \
+          STRIP="${{ steps.ndk.outputs.strip }}" \
+          ./configure \
+            --host="$TARGET" \
+            --prefix="$(pwd)/../install" \
+            --disable-shared \
+            --enable-static
+
+          make -j"$(nproc)"
+          make install
+
+      - name: Build FlipMouse binary
+        run: |
+          ${{ steps.ndk.outputs.cc }} \
+            -I build/install/include \
+            -I build/install/include/libevdev-1.0 \
+            -L build/install/lib \
+            -o build/mouse \
+            *.c \
+            -levdev
+
+          ${{ steps.ndk.outputs.strip }} build/mouse
+
+          echo "Binary size: $(stat -c%s build/mouse) bytes"
+          file build/mouse
+
+      - name: Bundle Magisk module
+        id: bundle
+        run: |
+          rm -rf build/bundle
+          mkdir -p build/bundle
+          cp -r properties/* build/bundle/
+          cp build/mouse build/bundle/
+          cd build/bundle
+          zip -r FlipMouse.zip .
+
+          echo "sha256=$(sha256sum FlipMouse.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Parse version
+        id: version
+        run: |
+          echo "code=$(grep 'versionCode' properties/module.prop | grep -oP '\d+' | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: "version_code=${{ steps.version.outputs.code }}\nsha256=${{ steps.bundle.outputs.sha256 }}"
+          files: build/bundle/FlipMouse.zip

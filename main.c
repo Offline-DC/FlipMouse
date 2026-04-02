@@ -578,7 +578,10 @@ static void mouse_cleanup(void)
 }
 
 /* manual toggle via KEY_HELP/KEY_F12 */
-#define TOGGLE_TAP_MAX_MS 400   // tap threshold; tweak 250–600 as desired
+#define TOGGLE_TAP_MAX_MS 1000  // tap threshold: <=1s = mouse toggle, >1s = type-sync broadcast
+#define TOGGLE_DEBOUNCE_MS 2000 // ignore rapid repeated long-presses
+
+static long long last_typesync_broadcast_ms = 0;
 
 static int mouse_toggle(struct input_event *ev)
 {
@@ -614,7 +617,17 @@ if (ev->value == 1) // key down
     }
     else
     {
-      log_message("TOGGLE ignored (hold too long) held=%lldms", held);
+      log_message("TOGGLE long-press held=%lldms -> type-sync broadcast", held);
+      if (now - last_typesync_broadcast_ms >= TOGGLE_DEBOUNCE_MS)
+      {
+        last_typesync_broadcast_ms = now;
+        system("am broadcast -a com.offlineinc.dumbdownlauncher.TOGGLE_TYPESYNC "
+               "--receiver-foreground > /dev/null 2>&1 &");
+      }
+      else
+      {
+        log_message("TOGGLE long-press debounced (last=%lldms ago)", now - last_typesync_broadcast_ms);
+      }
     }
 
     app_state.mouse.toggle_down_at_ms = 0;
