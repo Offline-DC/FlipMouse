@@ -39,6 +39,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/ioctl.h>
 
 /* Configuration */
