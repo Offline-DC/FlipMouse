@@ -605,9 +605,10 @@ static void check_long_press_timer(void)
   if (app_state.mouse.toggle_down_at_ms == 0) return; /* key not held */
   if (toggle_long_press_fired)               return; /* already fired */
 
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  long long now  = (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+  /* Use CLOCK_MONOTONIC — same source as input event timestamps on Android. */
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  long long now  = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
   long long held = now - app_state.mouse.toggle_down_at_ms;
 
   if (held >= TOGGLE_TAP_MAX_MS)
