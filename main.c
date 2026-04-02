@@ -983,13 +983,12 @@ static int run_event_loop(void)
     if (sel > 0 && app_state.control_fd >= 0 && FD_ISSET(app_state.control_fd, &rfds))
       control_handle_ready();
 
-    /* On timeout (no events), check whether the star key has been held long
-     * enough to trigger the type-sync broadcast mid-hold. */
-    if (sel == 0)
-    {
-      check_long_press_timer();
-      continue;
-    }
+    /* Check long-press timer on every iteration — not just on timeout.
+     * While a key is held the kernel sends auto-repeat events every ~33ms,
+     * so select() never times out and sel==0 is never reached. */
+    check_long_press_timer();
+
+    if (sel == 0) continue;
 
     for (device_t *d = app_state.devices; d; d = d->next)
     {
