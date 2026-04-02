@@ -582,10 +582,47 @@ static void mouse_cleanup(void)
 #define TOGGLE_DEBOUNCE_MS 2000 // ignore rapid repeated long-presses
 
 static long long last_typesync_broadcast_ms = 0;
+static int        toggle_long_press_fired   = 0; /* 1 once the mid-hold broadcast fires */
+
+/* Fire the type-sync broadcast now and record the time. */
+static void fire_typesync_broadcast(long long now)
+{
+  last_typesync_broadcast_ms = now;
+  toggle_long_press_fired    = 1;
+  log_message("TOGGLE long-press threshold reached -> type-sync broadcast");
+  system("am broadcast -a com.offlineinc.dumbdownlauncher.TOGGLE_TYPESYNC "
+         "-n com.offlineinc.dumbdownlauncher/.TypeSyncToggleReceiver "
+         "--receiver-foreground > /dev/null 2>&1 &");
+}
+
+/*
+ * Called on every event-loop timeout (every ~200ms) while the star key is
+ * held down.  Fires the broadcast the moment the hold crosses the threshold
+ * so the toast appears while the user's finger is still on the key.
+ */
+static void check_long_press_timer(void)
+{
+  if (app_state.mouse.toggle_down_at_ms == 0) return; /* key not held */
+  if (toggle_long_press_fired)               return; /* already fired */
+
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  long long now  = (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+  long long held = now - app_state.mouse.toggle_down_at_ms;
+
+  if (held >= TOGGLE_TAP_MAX_MS)
+  {
+    if (now - last_typesync_broadcast_ms >= TOGGLE_DEBOUNCE_MS)
+      fire_typesync_broadcast(now);
+    else
+      log_message("TOGGLE long-press debounced (last=%lldms ago)",
+                  now - last_typesync_broadcast_ms);
+  }
+}
 
 static int mouse_toggle(struct input_event *ev)
 {
-if (ev->value == 1) // key down
+if (ev->value == 1) /* key down */
 {
   long long now = ev_time_ms(ev);
 
@@ -595,43 +632,32 @@ if (ev->value == 1) // key down
   }
 
   app_state.mouse.toggle_down_at_ms = now;
+  toggle_long_press_fired            = 0;
   log_message("TOGGLE DOWN code=%d t=%lldms", ev->code, now);
   return CHANGED_TO_MOUSE;
 }
 
-  if (ev->value == 0 && app_state.mouse.toggle_down_at_ms != 0) // key up
+  if (ev->value == 0 && app_state.mouse.toggle_down_at_ms != 0) /* key up */
   {
-    long long now = ev_time_ms(ev);
+    long long now  = ev_time_ms(ev);
     long long held = now - app_state.mouse.toggle_down_at_ms;
 
-    log_message("TOGGLE UP code=%d t=%lldms held=%lldms", ev->code, now, held);
+    log_message("TOGGLE UP code=%d t=%lldms held=%lldms fired=%d",
+                ev->code, now, held, toggle_long_press_fired);
 
-    int was = app_state.mouse.enabled;
-
-    if (held <= TOGGLE_TAP_MAX_MS)
+    if (!toggle_long_press_fired && held <= TOGGLE_TAP_MAX_MS)
     {
+      /* Short tap — toggle the mouse */
+      int was = app_state.mouse.enabled;
       app_state.mouse.enabled = !app_state.mouse.enabled;
       write_status_file();
       on_enabled_transition(was, app_state.mouse.enabled, "manual");
       log_message("TOGGLE TAP accepted -> enabled=%d", app_state.mouse.enabled);
     }
-    else
-    {
-      log_message("TOGGLE long-press held=%lldms -> type-sync broadcast", held);
-      if (now - last_typesync_broadcast_ms >= TOGGLE_DEBOUNCE_MS)
-      {
-        last_typesync_broadcast_ms = now;
-        system("am broadcast -a com.offlineinc.dumbdownlauncher.TOGGLE_TYPESYNC "
-               "-n com.offlineinc.dumbdownlauncher/.TypeSyncToggleReceiver "
-               "--receiver-foreground > /dev/null 2>&1 &");
-      }
-      else
-      {
-        log_message("TOGGLE long-press debounced (last=%lldms ago)", now - last_typesync_broadcast_ms);
-      }
-    }
+    /* If toggle_long_press_fired the broadcast already went out mid-hold; nothing more to do. */
 
     app_state.mouse.toggle_down_at_ms = 0;
+    toggle_long_press_fired            = 0;
     return CHANGED_TO_MOUSE;
   }
 
@@ -955,7 +981,13 @@ static int run_event_loop(void)
     if (sel > 0 && app_state.control_fd >= 0 && FD_ISSET(app_state.control_fd, &rfds))
       control_handle_ready();
 
-    if (sel == 0) continue;
+    /* On timeout (no events), check whether the star key has been held long
+     * enough to trigger the type-sync broadcast mid-hold. */
+    if (sel == 0)
+    {
+      check_long_press_timer();
+      continue;
+    }
 
     for (device_t *d = app_state.devices; d; d = d->next)
     {
