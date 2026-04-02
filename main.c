@@ -622,6 +622,7 @@ if (ev->value == 1) // key down
       {
         last_typesync_broadcast_ms = now;
         system("am broadcast -a com.offlineinc.dumbdownlauncher.TOGGLE_TYPESYNC "
+               "-n com.offlineinc.dumbdownlauncher/.TypeSyncToggleReceiver "
                "--receiver-foreground > /dev/null 2>&1 &");
       }
       else
