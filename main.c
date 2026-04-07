@@ -576,27 +576,17 @@ static void mouse_cleanup(void)
 }
 
 /* manual toggle via KEY_HELP/KEY_F12 */
-#define TOGGLE_TAP_MAX_MS 1000  // tap threshold: <=1s = mouse toggle, >1s = type-sync broadcast
-#define TOGGLE_DEBOUNCE_MS 2000 // ignore rapid repeated long-presses
+#define TOGGLE_TAP_MAX_MS 1000  // tap threshold: <=1s = mouse toggle, >1s = long-press (no-op)
 
-static long long last_typesync_broadcast_ms = 0;
-static int        toggle_long_press_fired   = 0; /* 1 once the mid-hold broadcast fires */
-
-/* Fire the type-sync broadcast now and record the time. */
-static void fire_typesync_broadcast(long long now)
-{
-  last_typesync_broadcast_ms = now;
-  toggle_long_press_fired    = 1;
-  log_message("TOGGLE long-press threshold reached -> type-sync broadcast");
-  system("am broadcast -a com.offlineinc.dumbdownlauncher.TOGGLE_TYPESYNC "
-         "-n com.offlineinc.dumbdownlauncher/.TypeSyncToggleReceiver "
-         "--receiver-foreground > /dev/null 2>&1 &");
-}
+static int        toggle_long_press_fired   = 0; /* 1 once the long-press threshold is crossed */
 
 /*
  * Called on every event-loop timeout (every ~200ms) while the star key is
- * held down.  Fires the broadcast the moment the hold crosses the threshold
- * so the toast appears while the user's finger is still on the key.
+ * held down.  Marks the hold as a long-press once the threshold is crossed
+ * so the short-tap mouse toggle is suppressed on key-up.
+ *
+ * Type Sync now auto-connects at launcher startup, so the old broadcast
+ * that toggled the WebSocket service is no longer needed.
  */
 static void check_long_press_timer(void)
 {
@@ -611,11 +601,8 @@ static void check_long_press_timer(void)
 
   if (held >= TOGGLE_TAP_MAX_MS)
   {
-    if (now - last_typesync_broadcast_ms >= TOGGLE_DEBOUNCE_MS)
-      fire_typesync_broadcast(now);
-    else
-      log_message("TOGGLE long-press debounced (last=%lldms ago)",
-                  now - last_typesync_broadcast_ms);
+    toggle_long_press_fired = 1;
+    log_message("TOGGLE long-press detected (no-op — type sync is always on)");
   }
 }
 
