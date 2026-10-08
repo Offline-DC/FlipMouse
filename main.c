@@ -699,10 +699,26 @@ static int mouse_handle_event(device_t *dev, struct input_event *ev)
   }
   else if (ev->type == EV_KEY)
   {
-    if (keymap_get_scanvalue(keycode) != -1)
+    /* TCL: arrows arrive twice, as MSC_SCAN and as EV_KEY; the scan code is
+     * what becomes mouse movement, so the EV_KEY half is dropped here. The
+     * HIT's kernel sends no MSC_SCAN at all, so there the EV_KEY is the only
+     * copy and must go on to the switch below. */
+    if (!app_state.hit_mode && keymap_get_scanvalue(keycode) != -1)
     {
       log_message("Keycode %d handled by MSC_SCAN", keycode);
       return MUTE_EVENT;
+    }
+    /* HIT: move/scroll on press and auto-repeat only, not on release. */
+    if (app_state.hit_mode && ev->value == 0)
+    {
+      switch (keycode)
+      {
+      case KEY_UP: case KEY_DOWN: case KEY_LEFT: case KEY_RIGHT:
+      case KEY_MENU: case KEY_SEND:
+        return MUTE_EVENT;
+      default:
+        break;
+      }
     }
   }
 
