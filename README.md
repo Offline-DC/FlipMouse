@@ -146,6 +146,11 @@ FlipMouse works by:
 Currently supported devices:
 
 - TCL FLIP 2
+- HIT K1 slider (keypad `aw9523-key`). On this phone the daemon only takes hold
+  of the keypad while the mouse is enabled (the launcher enables it when a
+  mouse-driven app is in front); the rest of the time keys reach Android
+  directly. The right soft key toggles drag. There is no toggle key on the
+  HIT: enable/disable come from the launcher over the control socket.
 - AT Translated Set 2 keyboard (standard laptop keyboards)
 
 ## License

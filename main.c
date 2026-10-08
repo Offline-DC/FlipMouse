@@ -84,6 +84,8 @@ typedef struct dev_st
   const char *name;
   struct libevdev *evdev;
   struct libevdev_uinput *uidev;
+  int grabbed;    /* we hold the device exclusively and re-emit through uidev */
+  int want_grab;  /* desired grab state; applied once every key is up */
   struct dev_st *next;
 } device_t;
 
@@ -110,14 +112,25 @@ typedef struct
 
   /* control interface state */
   int control_fd;
+
+  /* HIT K1 (keypad "aw9523-key"): hold the keypad only while the mouse is on.
+   * On the TCL the daemon grabs its keypad for life and re-emits every key;
+   * on the HIT that would put it in the path of every press for no reason,
+   * so there the grab follows the enable/disable state instead. 0 = TCL
+   * behaviour, unchanged. */
+  int hit_mode;
 } app_state_t;
 
 /* Device list */
 static const char *supported_devices[] = {
     "mtk-kpd",
     "matrix-keypad",
+    "aw9523-key",                   /* HIT K1 keypad (slider) */
     "AT Translated Set 2 keyboard", /* Laptop Keyboard */
     NULL};
+
+#define HIT_KEYPAD_NAME "aw9523-key"
+#define LAPTOP_NAME     "AT Translated Set 2 keyboard"
 
 /* Keymap configurations */
 static const keymap_t keypad_keymap[] = {
@@ -153,6 +166,9 @@ static int mouse_handle_event(device_t *dev, struct input_event *ev);
 /* Device handling */
 static int devices_find_and_init(void);
 static void devices_cleanup(void);
+static int device_all_keys_up(device_t *dev);
+static void device_apply_grab(device_t *dev, const char *why);
+static void devices_set_grab(int want, const char *why);
 
 /* Event handling */
 static int handle_input_event(device_t *dev, struct input_event *ev);
@@ -352,6 +368,7 @@ static void on_enabled_transition(int was_enabled, int now_enabled, const char *
 
   if (!was_enabled && now_enabled)
   {
+    if (app_state.hit_mode) devices_set_grab(1, why);
     /* enabling: re-sync position then go to center */
     park_bottom_right();
     move_from_park_to_center();
@@ -361,6 +378,7 @@ static void on_enabled_transition(int was_enabled, int now_enabled, const char *
   {
     /* disabling: park */
     park_bottom_right();
+    if (app_state.hit_mode) devices_set_grab(0, why);
     log_message("Mouse disabled (%s)", why);
   }
 }
@@ -696,6 +714,9 @@ static int mouse_handle_event(device_t *dev, struct input_event *ev)
     ev->code = BTN_LEFT;
     return CHANGED_TO_MOUSE;
 
+  case KEY_F2:
+    if (!app_state.hit_mode) return PASS_THRU_EVENT; /* HIT right soft key only */
+    /* fall through */
   case KEY_B:
     if (ev->value == 1)
     {
@@ -819,10 +840,11 @@ static int devices_find_and_init(void)
         dev->name = libevdev_get_name(evdev);
         dev->evdev = evdev;
         dev->uidev = NULL;
+        dev->grabbed = 0;
+        dev->want_grab = 0;
         dev->next = NULL;
-
-        if (ioctl(dev->fd, EVIOCGRAB, 1) < 0)
-          log_message("WARNING: Failed to grab device exclusively");
+        if (strcmp(dev->name, HIT_KEYPAD_NAME) == 0)
+          app_state.hit_mode = 1;
 
         if (libevdev_uinput_create_from_device(dev->evdev,
                                                LIBEVDEV_UINPUT_OPEN_MANAGED,
@@ -837,7 +859,7 @@ static int devices_find_and_init(void)
 
         log_message("Successfully attached device: %s", dev->name);
 
-        if (i > 1)
+        if (strcmp(dev->name, LAPTOP_NAME) == 0)
         {
           log_message("Using laptop keymap");
           app_state.keymap = laptop_keymap;
@@ -875,7 +897,94 @@ static int devices_find_and_init(void)
   }
 
   closedir(dir);
+
+  if (app_state.hit_mode)
+  {
+    /* HIT: only the aw9523 keypad carries keys we care about. Drop anything
+     * else we attached (mtk-kpd there is power/side keys) so it is never
+     * grabbed or re-emitted. The keypad itself stays ungrabbed until the
+     * mouse is enabled. */
+    device_t **pp = &app_state.devices;
+    while (*pp)
+    {
+      device_t *d = *pp;
+      if (strcmp(d->name, HIT_KEYPAD_NAME) != 0)
+      {
+        log_message("HIT mode: releasing %s (not the keypad)", d->name);
+        *pp = d->next;
+        if (d->uidev) libevdev_uinput_destroy(d->uidev);
+        if (d->evdev) libevdev_free(d->evdev);
+        if (d->fd >= 0) close(d->fd);
+        free(d);
+        continue;
+      }
+      pp = &d->next;
+    }
+    log_message("HIT mode: keypad grabbed only while the mouse is enabled");
+  }
+  else
+  {
+    /* TCL and everything else: grab for life, exactly as before. The daemon
+     * always re-emitted events here even when the grab itself failed, so
+     * keep treating the device as held in that case too. */
+    for (device_t *d = app_state.devices; d; d = d->next)
+    {
+      d->want_grab = 1;
+      d->grabbed = 1;
+      if (ioctl(d->fd, EVIOCGRAB, 1) < 0)
+        log_message("WARNING: Failed to grab device exclusively");
+    }
+  }
+
   return result;
+}
+
+/* True when no key is currently held on the device (kernel state, works
+ * whether or not we hold the grab). */
+static int device_all_keys_up(device_t *dev)
+{
+  unsigned char bits[KEY_MAX / 8 + 1];
+  memset(bits, 0, sizeof(bits));
+  if (ioctl(dev->fd, EVIOCGKEY(sizeof(bits)), bits) < 0)
+    return 1; /* cannot tell; do not block forever */
+  for (size_t i = 0; i < sizeof(bits); i++)
+    if (bits[i]) return 0;
+  return 1;
+}
+
+/* Apply a pending grab/ungrab, but only between presses: taking the keypad
+ * while a key is down means Android never sees that key go up and treats it
+ * as held forever; letting go while a key is down leaves the same stuck key
+ * on our clone device. So the switch waits for an all-keys-up moment. */
+static void device_apply_grab(device_t *dev, const char *why)
+{
+  if (dev->want_grab == dev->grabbed) return;
+  if (!device_all_keys_up(dev)) return;
+  if (dev->want_grab)
+  {
+    if (ioctl(dev->fd, EVIOCGRAB, 1) < 0)
+    {
+      log_message("WARNING: grab failed (%s)", why);
+      return;
+    }
+    dev->grabbed = 1;
+    log_message("Keypad grabbed (%s)", why);
+  }
+  else
+  {
+    ioctl(dev->fd, EVIOCGRAB, 0);
+    dev->grabbed = 0;
+    log_message("Keypad released (%s)", why);
+  }
+}
+
+static void devices_set_grab(int want, const char *why)
+{
+  for (device_t *d = app_state.devices; d; d = d->next)
+  {
+    d->want_grab = want;
+    device_apply_grab(d, why);
+  }
 }
 
 static void devices_cleanup(void)
@@ -1004,7 +1113,28 @@ static int run_event_loop(void)
       log_event(prefix, &event);
 #endif
 
+      if (!d->grabbed)
+      {
+        /* Not holding the keypad: Android is reading these events itself.
+         * Only use them to catch an all-keys-up moment for a pending grab. */
+        if (event.type == EV_KEY && event.value == 0)
+          device_apply_grab(d, "key released");
+        continue;
+      }
+
+      struct input_event raw = event; /* before handle_input_event rewrites it */
       event_result = handle_input_event(d, &event);
+
+      /* A pending release (mouse just turned off) completes on the next key up:
+       * pass that key up through as-is so our clone device ends with no key held,
+       * then let go of the keypad. */
+      if (raw.type == EV_KEY && raw.value == 0 && d->want_grab != d->grabbed)
+      {
+        libevdev_uinput_write_event(d->uidev, raw.type, raw.code, raw.value);
+        libevdev_uinput_write_event(d->uidev, EV_SYN, SYN_REPORT, 0);
+        device_apply_grab(d, "key released");
+        continue;
+      }
 
       if (event_result > 0)
       {
