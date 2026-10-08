@@ -119,7 +119,17 @@ typedef struct
    * so there the grab follows the enable/disable state instead. 0 = TCL
    * behaviour, unchanged. */
   int hit_mode;
+
+  /* HIT auto-repeat. The aw9523 driver sends one press and one release and
+   * nothing in between, where the TCL's kernel repeats a held key every
+   * ~33 ms (which is what makes the cursor glide). So in HIT mode we repeat
+   * a held movement/scroll key ourselves on the same schedule. */
+  int hit_held_key;             /* keycode currently held, or 0 */
+  long long hit_next_repeat_ms; /* when to synthesize the next repeat */
 } app_state_t;
+
+#define HIT_REPEAT_DELAY_MS  250 /* first repeat, like the kernel default */
+#define HIT_REPEAT_PERIOD_MS 33  /* then this often */
 
 /* Device list */
 static const char *supported_devices[] = {
@@ -378,6 +388,7 @@ static void on_enabled_transition(int was_enabled, int now_enabled, const char *
   {
     /* disabling: park */
     park_bottom_right();
+    app_state.hit_held_key = 0;
     if (app_state.hit_mode) devices_set_grab(0, why);
     log_message("Mouse disabled (%s)", why);
   }
@@ -708,14 +719,25 @@ static int mouse_handle_event(device_t *dev, struct input_event *ev)
       log_message("Keycode %d handled by MSC_SCAN", keycode);
       return MUTE_EVENT;
     }
-    /* HIT: move/scroll on press and auto-repeat only, not on release. */
-    if (app_state.hit_mode && ev->value == 0)
+    /* HIT: move/scroll on press and (our own) auto-repeat, not on release;
+     * remember the held key so the loop can repeat it. */
+    if (app_state.hit_mode)
     {
       switch (keycode)
       {
       case KEY_UP: case KEY_DOWN: case KEY_LEFT: case KEY_RIGHT:
       case KEY_MENU: case KEY_SEND:
-        return MUTE_EVENT;
+        if (ev->value == 1)
+        {
+          app_state.hit_held_key = keycode;
+          app_state.hit_next_repeat_ms = monotonic_now_ms() + HIT_REPEAT_DELAY_MS;
+        }
+        else if (ev->value == 0)
+        {
+          if (app_state.hit_held_key == keycode) app_state.hit_held_key = 0;
+          return MUTE_EVENT;
+        }
+        break;
       default:
         break;
       }
@@ -1094,6 +1116,12 @@ static int run_event_loop(void)
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 200000;
+    if (app_state.hit_held_key && app_state.mouse.enabled)
+    {
+      long long wait = app_state.hit_next_repeat_ms - monotonic_now_ms();
+      if (wait < 1) wait = 1;
+      if (wait * 1000 < tv.tv_usec) tv.tv_usec = (suseconds_t)(wait * 1000);
+    }
 
     int sel = select(maxfd, &rfds, NULL, NULL, &tv);
     if (sel < 0)
@@ -1111,6 +1139,24 @@ static int run_event_loop(void)
      * While a key is held the kernel sends auto-repeat events every ~33ms,
      * so select() never times out and sel==0 is never reached. */
     check_long_press_timer();
+
+    /* HIT: repeat a held movement/scroll key on the kernel's usual schedule. */
+    if (app_state.hit_held_key && app_state.mouse.enabled && app_state.devices
+        && app_state.devices->grabbed
+        && monotonic_now_ms() >= app_state.hit_next_repeat_ms)
+    {
+      struct input_event rep;
+      memset(&rep, 0, sizeof(rep));
+      rep.type = EV_KEY;
+      rep.code = (unsigned short)app_state.hit_held_key;
+      rep.value = 2;
+      if (mouse_handle_event(app_state.devices, &rep) < 0)
+      {
+        libevdev_uinput_write_event(app_state.mouse.uidev, rep.type, rep.code, rep.value);
+        libevdev_uinput_write_event(app_state.mouse.uidev, EV_SYN, SYN_REPORT, 0);
+      }
+      app_state.hit_next_repeat_ms = monotonic_now_ms() + HIT_REPEAT_PERIOD_MS;
+    }
 
     if (sel == 0) continue;
 
