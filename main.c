@@ -16,6 +16,16 @@
  *
  * Device: TCL Flip 2 (Android 9)
  * wm size: 240x320
+ *
+ * v12, HIT K1 only (TCL behaviour is unchanged):
+ * - The slide-out QWERTY's arrows and OK ("mtk-kpd") drive the mouse too.
+ *   That device is only held while the mouse is on AND the slider is open;
+ *   with the phone closed it is left alone, as in v11.
+ * - With the slider open the screen is turned, and the front d-pad's
+ *   movement is turned with it (it used to come out a quarter turn off).
+ * - The letter B types a "b" instead of toggling drag.
+ * - No key toggles the mouse from inside the daemon (the launcher does it),
+ *   so the camera key is never mistaken for the toggle.
  */
 
 // #define DEBUG 1
@@ -86,6 +96,7 @@ typedef struct dev_st
   struct libevdev_uinput *uidev;
   int grabbed;    /* we hold the device exclusively and re-emit through uidev */
   int want_grab;  /* desired grab state; applied once every key is up */
+  int turns;      /* HIT front keypad: its arrows turn with the screen */
   struct dev_st *next;
 } device_t;
 
@@ -126,10 +137,21 @@ typedef struct
    * a held movement/scroll key ourselves on the same schedule. */
   int hit_held_key;             /* keycode currently held, or 0 */
   long long hit_next_repeat_ms; /* when to synthesize the next repeat */
+  device_t *hit_held_dev;       /* the device that key is held on */
+  int hit_synth_repeat;         /* 1 while one of our own repeats is being fed in */
+
+  /* HIT screen rotation, 0..3 as Android counts it (Settings.System
+   * user_rotation; the ROM sets 1 while the slider is open). Android turns
+   * the front keypad's arrows to match the screen (aw9523-key.idc,
+   * keyboard.orientationAware = 1), but this daemon reads the keys before
+   * Android does, so it has to turn the mouse movement itself. */
+  int hit_rotation;
+  long long hit_next_rot_check_ms; /* next look at it while the mouse is on */
 } app_state_t;
 
 #define HIT_REPEAT_DELAY_MS  250 /* first repeat, like the kernel default */
 #define HIT_REPEAT_PERIOD_MS 33  /* then this often */
+#define HIT_ROT_CHECK_MS     700 /* mouse on: follow the slider this often */
 
 /* Device list */
 static const char *supported_devices[] = {
@@ -140,6 +162,13 @@ static const char *supported_devices[] = {
     NULL};
 
 #define HIT_KEYPAD_NAME "aw9523-key"
+/* HIT: the slide-out QWERTY's arrows and OK, and the red (power) key. The
+ * same name is the TCL's keypad, where nothing about it changes. */
+#define HIT_QWERTY_NAME "mtk-kpd"
+/* Where Android keeps Settings.System on disk (plain XML on the HIT's 8.1). */
+#ifndef HIT_SETTINGS_XML
+#define HIT_SETTINGS_XML "/data/system/users/0/settings_system.xml"
+#endif
 #define LAPTOP_NAME     "AT Translated Set 2 keyboard"
 
 /* Keymap configurations */
@@ -178,7 +207,12 @@ static int devices_find_and_init(void);
 static void devices_cleanup(void);
 static int device_all_keys_up(device_t *dev);
 static void device_apply_grab(device_t *dev, const char *why);
-static void devices_set_grab(int want, const char *why);
+
+/* HIT screen rotation */
+static int hit_parse_user_rotation(const char *xml);
+static void hit_refresh_rotation(void);
+static void hit_turn(const device_t *dev, int *dx, int *dy);
+static void hit_update_grabs(const char *why);
 
 /* Event handling */
 static int handle_input_event(device_t *dev, struct input_event *ev);
@@ -354,6 +388,13 @@ static void move_from_park_to_center(void)
   int left = 40;
   int up   = 60;
 
+  /* HIT, screen on its side: the screen is wider than tall, so swap. */
+  if (app_state.hit_mode && (app_state.hit_rotation & 1))
+  {
+    left = 60;
+    up   = 40;
+  }
+
   /* Move X first, then Y. Some stacks do weird things when both axes change together. */
   while (left > 0)
   {
@@ -378,7 +419,11 @@ static void on_enabled_transition(int was_enabled, int now_enabled, const char *
 
   if (!was_enabled && now_enabled)
   {
-    if (app_state.hit_mode) devices_set_grab(1, why);
+    if (app_state.hit_mode)
+    {
+      hit_refresh_rotation();
+      hit_update_grabs(why);
+    }
     /* enabling: re-sync position then go to center */
     park_bottom_right();
     move_from_park_to_center();
@@ -389,7 +434,8 @@ static void on_enabled_transition(int was_enabled, int now_enabled, const char *
     /* disabling: park */
     park_bottom_right();
     app_state.hit_held_key = 0;
-    if (app_state.hit_mode) devices_set_grab(0, why);
+    app_state.hit_held_dev = NULL;
+    if (app_state.hit_mode) hit_update_grabs(why);
     log_message("Mouse disabled (%s)", why);
   }
 }
@@ -482,10 +528,22 @@ static void control_handle_command(int client_fd, const char *cmd)
   }
   else if (strncmp(cmd, "status", 6) == 0)
   {
-    dprintf(client_fd, "enabled=%d speed=%d drag=%d\n",
-            app_state.mouse.enabled,
-            app_state.mouse.speed,
-            app_state.mouse.drag_mode);
+    if (app_state.hit_mode)
+    {
+      hit_refresh_rotation();
+      dprintf(client_fd, "enabled=%d speed=%d drag=%d rot=%d\n",
+              app_state.mouse.enabled,
+              app_state.mouse.speed,
+              app_state.mouse.drag_mode,
+              app_state.hit_rotation);
+    }
+    else
+    {
+      dprintf(client_fd, "enabled=%d speed=%d drag=%d\n",
+              app_state.mouse.enabled,
+              app_state.mouse.speed,
+              app_state.mouse.drag_mode);
+    }
   }
   else if (strncmp(cmd, "quit", 4) == 0)
   {
@@ -544,6 +602,106 @@ static int control_send_cmd(const char *cmd)
 
   close(fd);
   return 0;
+}
+
+/* --- HIT screen rotation --- */
+
+/* Pull user_rotation out of settings_system.xml text. The line looks like
+ *   <setting id="57" name="user_rotation" value="1" package="android" ... />
+ * Returns 0..3. A file without the setting means it was never changed from
+ * its default, which is 0. */
+static int hit_parse_user_rotation(const char *xml)
+{
+  const char *name = strstr(xml, "name=\"user_rotation\"");
+  if (!name) return 0;
+
+  /* The whole <setting ... /> element this name sits in. */
+  const char *start = name;
+  while (start > xml && *start != '<') start--;
+  const char *end = strchr(name, '>');
+  if (!end) end = name + strlen(name);
+
+  for (const char *p = start; p + 7 < end; p++)
+  {
+    /* " value=" with the space, so "defaultValue=" can never match. */
+    if (p[0] == ' ' && strncmp(p + 1, "value=\"", 7) == 0)
+    {
+      int v = atoi(p + 8);
+      return (v >= 0 && v <= 3) ? v : 0;
+    }
+  }
+  return 0;
+}
+
+/* Re-read the rotation. Cheap (one small file), so it is simply done every
+ * time it matters: when the mouse is switched on and on every arrow press.
+ * If the file cannot be read the last known value stays. */
+static void hit_refresh_rotation(void)
+{
+  static char buf[256 * 1024];
+
+  int fd = open(HIT_SETTINGS_XML, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;
+
+  size_t len = 0;
+  while (len < sizeof(buf) - 1)
+  {
+    ssize_t n = read(fd, buf + len, sizeof(buf) - 1 - len);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;
+    len += (size_t)n;
+  }
+  close(fd);
+  buf[len] = 0;
+  /* Android rewrites this file in place; a copy caught half written has no
+   * closing tag. Keep the last value and try again on the next press. */
+  if (!strstr(buf, "</settings>")) return;
+
+  int rot = hit_parse_user_rotation(buf);
+  if (rot != app_state.hit_rotation)
+  {
+    log_message("HIT screen rotation %d -> %d", app_state.hit_rotation, rot);
+    app_state.hit_rotation = rot;
+    /* The slider moved: take or let go of the QWERTY to match. */
+    if (app_state.mouse.enabled) hit_update_grabs("slider");
+  }
+}
+
+/* HIT: which devices to hold right now.
+ * - Mouse off: none (keys reach Android directly).
+ * - Mouse on: the front keypad, as in v11.
+ * - Mouse on and the screen on its side (slider open): the QWERTY device too,
+ *   so its arrows move the cursor instead of the app's focus. With the phone
+ *   closed its keys cannot be reached anyway, and it also carries the
+ *   red/power key, so it is left alone then. */
+static void hit_update_grabs(const char *why)
+{
+  for (device_t *d = app_state.devices; d; d = d->next)
+  {
+    int want = app_state.mouse.enabled &&
+               (d->turns || (app_state.hit_rotation & 1));
+    d->want_grab = want;
+    device_apply_grab(d, why);
+  }
+}
+
+/* Turn a movement that came from the front keypad so it matches the screen.
+ * Same table Android uses to turn that keypad's arrows: with the screen at
+ * rotation 1 the key that is "right" on the upright phone points up, "down"
+ * points right, "left" points down and "up" points left. Keys from the
+ * QWERTY are printed for the turned screen already and are left alone. */
+static void hit_turn(const device_t *dev, int *dx, int *dy)
+{
+  if (!app_state.hit_mode || !dev || !dev->turns) return;
+
+  int x = *dx, y = *dy;
+  switch (app_state.hit_rotation)
+  {
+  case 1: *dx = y;  *dy = -x; break;
+  case 2: *dx = -x; *dy = -y; break;
+  case 3: *dx = -y; *dy = x;  break;
+  default: break;
+  }
 }
 
 /* --- Mouse Functions --- */
@@ -730,11 +888,24 @@ static int mouse_handle_event(device_t *dev, struct input_event *ev)
         if (ev->value == 1)
         {
           app_state.hit_held_key = keycode;
+          app_state.hit_held_dev = dev;
           app_state.hit_next_repeat_ms = monotonic_now_ms() + HIT_REPEAT_DELAY_MS;
+          /* The slider may have moved since the last press. */
+          hit_refresh_rotation();
         }
         else if (ev->value == 0)
         {
-          if (app_state.hit_held_key == keycode) app_state.hit_held_key = 0;
+          if (app_state.hit_held_key == keycode)
+          {
+            app_state.hit_held_key = 0;
+            app_state.hit_held_dev = NULL;
+          }
+          return MUTE_EVENT;
+        }
+        else if (!app_state.hit_synth_repeat)
+        {
+          /* A repeat from the kernel (the QWERTY's driver may send them).
+           * We run our own repeat timer; two of them would double the speed. */
           return MUTE_EVENT;
         }
         break;
@@ -746,16 +917,24 @@ static int mouse_handle_event(device_t *dev, struct input_event *ev)
 
   switch (keycode)
   {
+  case KEY_OK:
+    /* HIT: the OK key in the middle of the QWERTY's arrows. */
+    if (!app_state.hit_mode || ev->type != EV_KEY) return PASS_THRU_EVENT;
+    /* fall through */
   case KEY_ENTER:
     log_message("Mouse left click");
     ev->type = EV_KEY;
     ev->code = BTN_LEFT;
     return CHANGED_TO_MOUSE;
 
+  case KEY_B:
+    /* HIT: B is a letter on the QWERTY; drag is the right soft key (F2). */
+    if (app_state.hit_mode) return PASS_THRU_EVENT;
+    goto toggle_drag;
+
   case KEY_F2:
     if (!app_state.hit_mode) return PASS_THRU_EVENT; /* HIT right soft key only */
-    /* fall through */
-  case KEY_B:
+  toggle_drag:
     if (ev->value == 1)
     {
       app_state.mouse.drag_mode = !app_state.mouse.drag_mode;
@@ -768,28 +947,31 @@ static int mouse_handle_event(device_t *dev, struct input_event *ev)
     break;
 
   case KEY_UP:
-    ev->type = EV_REL;
-    ev->code = REL_Y;
-    ev->value = -app_state.mouse.speed;
-    return CHANGED_TO_MOUSE;
-
   case KEY_DOWN:
-    ev->type = EV_REL;
-    ev->code = REL_Y;
-    ev->value = app_state.mouse.speed;
-    return CHANGED_TO_MOUSE;
-
   case KEY_LEFT:
-    ev->type = EV_REL;
-    ev->code = REL_X;
-    ev->value = -app_state.mouse.speed;
-    return CHANGED_TO_MOUSE;
-
   case KEY_RIGHT:
+  {
+    int dx = 0, dy = 0;
+    if (keycode == KEY_UP)         dy = -app_state.mouse.speed;
+    else if (keycode == KEY_DOWN)  dy = app_state.mouse.speed;
+    else if (keycode == KEY_LEFT)  dx = -app_state.mouse.speed;
+    else                           dx = app_state.mouse.speed;
+
+    hit_turn(dev, &dx, &dy); /* does nothing except on the HIT's front keypad */
+
     ev->type = EV_REL;
-    ev->code = REL_X;
-    ev->value = app_state.mouse.speed;
+    if (dx)
+    {
+      ev->code = REL_X;
+      ev->value = dx;
+    }
+    else
+    {
+      ev->code = REL_Y;
+      ev->value = dy;
+    }
     return CHANGED_TO_MOUSE;
+  }
 
   case KEY_MENU:
     if (slowdown_counter++ % WHEEL_SLOWDOWN_FACTOR)
@@ -880,9 +1062,13 @@ static int devices_find_and_init(void)
         dev->uidev = NULL;
         dev->grabbed = 0;
         dev->want_grab = 0;
+        dev->turns = 0;
         dev->next = NULL;
         if (strcmp(dev->name, HIT_KEYPAD_NAME) == 0)
+        {
           app_state.hit_mode = 1;
+          dev->turns = 1;
+        }
 
         if (libevdev_uinput_create_from_device(dev->evdev,
                                                LIBEVDEV_UINPUT_OPEN_MANAGED,
@@ -938,17 +1124,19 @@ static int devices_find_and_init(void)
 
   if (app_state.hit_mode)
   {
-    /* HIT: only the aw9523 keypad carries keys we care about. Drop anything
-     * else we attached (mtk-kpd there is power/side keys) so it is never
-     * grabbed or re-emitted. The keypad itself stays ungrabbed until the
-     * mouse is enabled. */
+    /* HIT: the keys we care about are on the aw9523 keypad (front keys) and
+     * on mtk-kpd (the slide-out QWERTY's arrows and OK; it also carries the
+     * red/power key, which is passed straight through like every other key
+     * we do not use). Drop anything else we attached. Both stay ungrabbed
+     * until the mouse is enabled. */
     device_t **pp = &app_state.devices;
     while (*pp)
     {
       device_t *d = *pp;
-      if (strcmp(d->name, HIT_KEYPAD_NAME) != 0)
+      if (strcmp(d->name, HIT_KEYPAD_NAME) != 0 &&
+          strcmp(d->name, HIT_QWERTY_NAME) != 0)
       {
-        log_message("HIT mode: releasing %s (not the keypad)", d->name);
+        log_message("HIT mode: releasing %s (not a keypad)", d->name);
         *pp = d->next;
         if (d->uidev) libevdev_uinput_destroy(d->uidev);
         if (d->evdev) libevdev_free(d->evdev);
@@ -958,7 +1146,12 @@ static int devices_find_and_init(void)
       }
       pp = &d->next;
     }
-    log_message("HIT mode: keypad grabbed only while the mouse is enabled");
+    for (device_t *d = app_state.devices; d; d = d->next)
+      log_message("HIT mode: using %s%s", d->name,
+                  d->turns ? " (arrows turn with the screen)" : "");
+    hit_refresh_rotation();
+    log_message("HIT mode: front keypad held while the mouse is on, %s also while the slider is open; screen rotation %d",
+                HIT_QWERTY_NAME, app_state.hit_rotation);
   }
   else
   {
@@ -1002,26 +1195,17 @@ static void device_apply_grab(device_t *dev, const char *why)
   {
     if (ioctl(dev->fd, EVIOCGRAB, 1) < 0)
     {
-      log_message("WARNING: grab failed (%s)", why);
+      log_message("WARNING: grab of %s failed (%s)", dev->name, why);
       return;
     }
     dev->grabbed = 1;
-    log_message("Keypad grabbed (%s)", why);
+    log_message("%s grabbed (%s)", dev->name, why);
   }
   else
   {
     ioctl(dev->fd, EVIOCGRAB, 0);
     dev->grabbed = 0;
-    log_message("Keypad released (%s)", why);
-  }
-}
-
-static void devices_set_grab(int want, const char *why)
-{
-  for (device_t *d = app_state.devices; d; d = d->next)
-  {
-    d->want_grab = want;
-    device_apply_grab(d, why);
+    log_message("%s released (%s)", dev->name, why);
   }
 }
 
@@ -1053,7 +1237,10 @@ static int handle_input_event(device_t *dev, struct input_event *ev)
 
   if (ev->type == EV_KEY)
   {
-    if (ev->code == KEY_HELP || ev->code == KEY_F12 || ev->code == KEY_FOCUS)
+    /* Not on the HIT: it has no toggle key (the launcher switches the mouse
+     * on and off), and code 212 is its camera button. */
+    if (!app_state.hit_mode &&
+        (ev->code == KEY_HELP || ev->code == KEY_F12 || ev->code == KEY_FOCUS))
     {
       log_message("EV_KEY toggle candidate code=%d value=%d enabled=%d t=%ld.%06ld",
                   ev->code, ev->value, app_state.mouse.enabled,
@@ -1116,7 +1303,8 @@ static int run_event_loop(void)
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 200000;
-    if (app_state.hit_held_key && app_state.mouse.enabled)
+    if (app_state.hit_held_key && app_state.mouse.enabled
+        && app_state.hit_held_dev && app_state.hit_held_dev->grabbed)
     {
       long long wait = app_state.hit_next_repeat_ms - monotonic_now_ms();
       if (wait < 1) wait = 1;
@@ -1140,9 +1328,17 @@ static int run_event_loop(void)
      * so select() never times out and sel==0 is never reached. */
     check_long_press_timer();
 
+    /* HIT: the slider can move while the mouse is on; follow it. */
+    if (app_state.hit_mode && app_state.mouse.enabled
+        && monotonic_now_ms() >= app_state.hit_next_rot_check_ms)
+    {
+      hit_refresh_rotation();
+      app_state.hit_next_rot_check_ms = monotonic_now_ms() + HIT_ROT_CHECK_MS;
+    }
+
     /* HIT: repeat a held movement/scroll key on the kernel's usual schedule. */
-    if (app_state.hit_held_key && app_state.mouse.enabled && app_state.devices
-        && app_state.devices->grabbed
+    if (app_state.hit_held_key && app_state.mouse.enabled && app_state.hit_held_dev
+        && app_state.hit_held_dev->grabbed
         && monotonic_now_ms() >= app_state.hit_next_repeat_ms)
     {
       struct input_event rep;
@@ -1150,7 +1346,10 @@ static int run_event_loop(void)
       rep.type = EV_KEY;
       rep.code = (unsigned short)app_state.hit_held_key;
       rep.value = 2;
-      if (mouse_handle_event(app_state.devices, &rep) < 0)
+      app_state.hit_synth_repeat = 1;
+      int rep_result = mouse_handle_event(app_state.hit_held_dev, &rep);
+      app_state.hit_synth_repeat = 0;
+      if (rep_result < 0)
       {
         libevdev_uinput_write_event(app_state.mouse.uidev, rep.type, rep.code, rep.value);
         libevdev_uinput_write_event(app_state.mouse.uidev, EV_SYN, SYN_REPORT, 0);
@@ -1237,7 +1436,7 @@ int main(int argc, char **argv)
   }
 
   log_init();
-  log_message("FlipMouse starting up");
+  log_message("FlipMouse starting up (v12)");
 
   setup_signal_handlers();
 
